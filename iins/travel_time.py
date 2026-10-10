@@ -1,13 +1,12 @@
 """Grid-level speed and cross-grid travel-time estimation.
 
-The paper uses a learned long-term latent speed predictor. A learned predictor can replace
-``fit`` later without changing the planner-facing ``TravelTimeField`` API.
+Learned future occupancy-flow prediction, physical units, and vehicle arrival exports.
+World-coordinate flow prediction on masked, irregular feasible regions.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Iterable
+from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
@@ -18,7 +17,7 @@ Array = np.ndarray
 
 @dataclass(frozen=True)
 class GridSpec:
-    """Uniform road grid in longitudinal/lateral vehicle-fixed coordinates."""
+    """Cartesian cell lattice with arbitrary feasible mask; s/y names mean world X/Y."""
 
     s_min: float
     s_max: float
@@ -26,31 +25,69 @@ class GridSpec:
     y_max: float
     ds: float
     dy: float
+    feasible_mask: Array | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.s_max <= self.s_min or self.y_max <= self.y_min:
             raise ValueError("Grid bounds must have positive extent")
         if self.ds <= 0 or self.dy <= 0:
             raise ValueError("Grid resolution must be positive")
+        if self.feasible_mask is not None and np.shape(self.feasible_mask)!=self.shape:
+            raise ValueError("feasible_mask must match grid shape")
+
+    @property
+    def mask(self):
+        return np.ones(self.shape,bool) if self.feasible_mask is None else np.asarray(self.feasible_mask,bool)
+
+    @property
+    def centers(self):
+        return np.stack(np.meshgrid(self.s_centers,self.y_centers,indexing='ij'),-1)
+
+    @classmethod
+    def from_road(cls,road,start_s,dx=4.,dy=2.):
+        origin=road.world(start_s,0.)
+        stations=np.linspace(max(0,start_s-8),min(road.length,start_s+120),129)
+        lo,hi=road.bounds(stations)
+        bottom=float(min(road.world(stations,lo)[:,1].min(),road.world(stations,hi)[:,1].min())-2.)
+        base=cls(float(origin[0]-8),float(origin[0]+120),bottom,bottom+48.,dx,dy)
+        return cls(base.s_min,base.s_max,base.y_min,base.y_max,dx,dy,road.feasible(base.centers))
+
+    @classmethod
+    def from_polygon(cls,vertices,resolution=(4.,2.)):
+        """Rasterize any simple polygon by ray casting; holes can use feasible_mask directly."""
+        v=np.asarray(vertices,float)
+        base=cls(v[:,0].min(),v[:,0].max(),v[:,1].min(),v[:,1].max(),*resolution)
+        x,y=np.moveaxis(base.centers,-1,0); inside=np.zeros(base.shape,bool)
+        for a,b in zip(v,np.roll(v,-1,axis=0)):
+            if abs(b[1]-a[1])>1e-12:
+                inside^=((a[1]>y)!=(b[1]>y))&(x<(b[0]-a[0])*(y-a[1])/(b[1]-a[1])+a[0])
+        return cls(base.s_min,base.s_max,base.y_min,base.y_max,*resolution,inside)
 
     @property
     def s_centers(self) -> Array:
-        count = int(np.ceil((self.s_max - self.s_min) / self.ds))
+        count = int(np.ceil((self.s_max - self.s_min) / self.ds - 1e-5))
         return self.s_min + (np.arange(count) + 0.5) * self.ds
 
     @property
     def y_centers(self) -> Array:
-        count = int(np.ceil((self.y_max - self.y_min) / self.dy))
+        count = int(np.ceil((self.y_max - self.y_min) / self.dy - 1e-5))
         return self.y_min + (np.arange(count) + 0.5) * self.dy
 
     @property
     def shape(self) -> tuple[int, int]:
         return len(self.s_centers), len(self.y_centers)
 
+    def contains(self,points):
+        points=np.asarray(points,float)
+        index=np.floor((points-[self.s_min,self.y_min])/[self.ds,self.dy]).astype(int)
+        i,j=index[...,0],index[...,1]
+        within=(i>=0)&(i<self.shape[0])&(j>=0)&(j<self.shape[1])
+        return within & self.mask[np.clip(i,0,self.shape[0]-1),np.clip(j,0,self.shape[1]-1)]
+
     def cell_index(self, s: float, y: float) -> tuple[int, int] | None:
-        i = int(np.floor((s - self.s_min) / self.ds))
-        j = int(np.floor((y - self.y_min) / self.dy))
-        if 0 <= i < self.shape[0] and 0 <= j < self.shape[1]:
+        i = int(np.floor((s - self.s_min) / self.ds - 1e-5))
+        j = int(np.floor((y - self.y_min) / self.dy - 1e-5))
+        if 0 <= i < self.shape[0] and 0 <= j < self.shape[1] and self.mask[i,j]:
             return i, j
         return None
 
@@ -80,6 +117,9 @@ class TravelTimeField:
         )
         object.__setattr__(self, "_interpolator", interpolator)
 
+    def bounds(self,s):
+        return self.grid.y_min,self.grid.y_max
+
     def lookup(self, s: Array | float, y: Array | float) -> Array:
         """Interpolate T(s, y), the time required for one longitudinal cell."""
 
@@ -95,6 +135,9 @@ class TravelTimeField:
             )
         )
         values = np.asarray(self._interpolator(points), dtype=float)
+        valid=self.grid.contains(np.stack([s_array,y_array],-1)).ravel()
+        if self.grid.feasible_mask is not None:
+            values=np.where(valid,values,np.inf)
         return np.maximum(values, 1e-6).reshape(s_array.shape)
 
     def transition_time(
@@ -112,6 +155,9 @@ class TravelTimeField:
         distance = float(np.linalg.norm(displacement))
         if distance == 0:
             return 0.0
+        points=np.linspace([s,y],[next_s,next_y],max(2,int(np.ceil(distance/min(self.grid.ds,self.grid.dy)))+1))
+        if self.grid.feasible_mask is not None and not self.grid.contains(points).all():
+            return float('inf')
         direction = displacement / distance
         query = [
             np.clip(s, self.grid.s_centers[0], self.grid.s_centers[-1]),
@@ -122,65 +168,168 @@ class TravelTimeField:
         return distance / projected_speed
 
 
-class GridTravelTimeEstimator:
-    """Estimate the paper's occupancy-flow tensor from sampled trajectories.
+@dataclass(frozen=True)
+class VehicleArrival:
+    """One vehicle's absolute arrival times and lateral centers at spatial steps.
 
-    Each trajectory is an ``(n, 3)`` array with columns ``[time, s, y]``.
-    Segment velocities are accumulated in the cell containing each segment's
-    midpoint.  Unobserved cells retain a configurable free-flow prior.
+    inf means the station is behind it or not reached in the prediction budget.
+    All consumers must use the same road coordinates and time origin.
     """
+    vehicle_id: str
+    stations: Array
+    times: Array
+    lateral: Array
+    half_width: float = 1.0
 
-    def __init__(
-        self,
-        grid: GridSpec,
-        *,
-        prior_speed: float = 12.0,
-        prior_weight: float = 1.0,
-        min_speed: float = 0.5,
-        max_speed: float = 45.0,
-    ) -> None:
-        if not 0 < min_speed <= prior_speed <= max_speed:
-            raise ValueError("Expected 0 < min_speed <= prior_speed <= max_speed")
-        if prior_weight < 0:
-            raise ValueError("prior_weight cannot be negative")
-        self.grid = grid
-        self.prior_speed = prior_speed
-        self.prior_weight = prior_weight
-        self.min_speed = min_speed
-        self.max_speed = max_speed
+    def __post_init__(self):
+        for name in ('stations','times','lateral'):
+            object.__setattr__(self,name,np.asarray(getattr(self,name),dtype=float))
+        if self.times.shape != self.stations.shape or self.lateral.shape != self.stations.shape:
+            raise ValueError('Arrival arrays must have equal shapes')
+        if np.any(np.diff(self.stations)<=0) or np.any(np.isnan(self.times)):
+            raise ValueError('Stations must increase and times cannot be NaN')
 
-    def fit(self, trajectories: Iterable[Array]) -> TravelTimeField:
-        shape = self.grid.shape
-        weighted_velocity = np.zeros(shape + (2,), dtype=float)
-        weighted_velocity[..., 0] = self.prior_speed * self.prior_weight
-        weights = np.full(shape, self.prior_weight, dtype=float)
-        observations = np.zeros(shape, dtype=float)
 
-        for trajectory in trajectories:
-            samples = np.asarray(trajectory, dtype=float)
-            if samples.ndim != 2 or samples.shape[1] != 3:
-                raise ValueError("Each trajectory must have shape (n, 3): [time, s, y]")
-            if len(samples) < 2:
+@dataclass(frozen=True)
+class FlowForecast:
+    grid: GridSpec
+    velocity: Array  # [H,W,Tf,2], m/s
+    occupancy: Array  # [H,W,Tf], probabilities
+    dt: float = .5
+    epoch: float = 0.
+
+    def field(self, future_index=0):
+        v=self.velocity[:,:,future_index]
+        return TravelTimeField(self.grid,v,self.occupancy[:,:,future_index],
+                               self.grid.ds/np.maximum(v[...,0],.5))
+
+    def vehicle_arrivals(self, vehicles, stations, max_duration=120., *, road=None, start_s=0.):
+        if road is not None:
+            return RoadTravelTimeField(self,road,start_s).vehicle_arrivals(vehicles,stations,max_duration)
+        stations=np.asarray(stations,dtype=float); results=[]
+        interps=[RegularGridInterpolator((self.grid.s_centers,self.grid.y_centers),self.velocity[:,:,k],bounds_error=False,fill_value=None) for k in range(self.velocity.shape[2])]
+        for vehicle in vehicles:
+            s=float(vehicle['s']); y=float(vehicle['y']); now=self.epoch
+            out=np.full(stations.shape,np.inf); lat=np.full(stations.shape,y)
+            if vehicle.get('stopped',False):
+                # Static occupancy needs geometric avoidance; never claim infinite time means safe.
+                results.append(VehicleArrival(str(vehicle['id']),stations,out,lat,vehicle.get('half_width',1.)))
                 continue
-            dt = np.diff(samples[:, 0])
-            displacement = np.diff(samples[:, 1:3], axis=0)
-            midpoints = 0.5 * (samples[:-1, 1:3] + samples[1:, 1:3])
-            for duration, delta, midpoint in zip(dt, displacement, midpoints):
-                if duration <= 0:
-                    continue
-                index = self.grid.cell_index(float(midpoint[0]), float(midpoint[1]))
-                if index is None:
-                    continue
-                velocity = delta / duration
-                magnitude = float(np.linalg.norm(velocity))
-                if magnitude > self.max_speed:
-                    velocity *= self.max_speed / magnitude
-                weighted_velocity[index] += velocity
-                weights[index] += 1.0
-                observations[index] += 1.0
+            for _ in range(int(max_duration/.1)):
+                query=[np.clip(s,self.grid.s_centers[0],self.grid.s_centers[-1]),np.clip(y,self.grid.y_centers[0],self.grid.y_centers[-1])]
+                k=min(int((now-self.epoch)/self.dt),len(interps)-1)
+                v=interps[k]([query])[0]; next_s=s+max(float(v[0]),0)*.1; next_y=y+float(v[1])*.1
+                crossed=(stations>=s)&(stations<=next_s)&~np.isfinite(out)
+                fraction=(stations[crossed]-s)/max(next_s-s,1e-12)
+                out[crossed]=now+.1*fraction; lat[crossed]=y+(next_y-y)*fraction
+                s,y,now=next_s,next_y,now+.1
+                if s>=stations[-1]: break
+            results.append(VehicleArrival(str(vehicle['id']),stations,out,lat,vehicle.get('half_width',1.)))
+        return results
 
-        velocity = weighted_velocity / np.maximum(weights[..., None], 1e-12)
-        occupancy = observations / max(float(observations.max()), 1.0)
-        forward_speed = np.maximum(velocity[..., 0], self.min_speed)
-        longitudinal_time = self.grid.ds / forward_speed
-        return TravelTimeField(self.grid, velocity, occupancy, longitudinal_time)
+
+class GridTravelTimeEstimator:
+    """Checkpoint-backed predictor; never fills unobserved cells with fixed speed."""
+    def __init__(self,grid,checkpoint=None):
+        from pathlib import Path
+        from .learn.training import load_model
+        self.grid=grid
+        self.checkpoint=Path(checkpoint) if checkpoint else Path(__file__).parent/'learn/weights/toll_plaza.pt'
+        self.model=load_model(self.checkpoint)
+
+    def predict(self,occupancy,trajectories,agent_mask=None,epoch=0.):
+        import torch
+        o=np.asarray(occupancy,dtype=np.float32); t=np.asarray(trajectories,dtype=np.float32)
+        if o.shape != self.grid.shape+(7,) or t.ndim!=3 or t.shape[1:]!=(7,3):
+            raise ValueError('Expected occupancy [H,W,7], trajectories [N,7,3]=[world_x,world_y,speed]')
+        if not np.isfinite(o).all() or not np.isfinite(t).all(): raise ValueError('Nonfinite input')
+        a=np.ones(len(t),bool) if agent_mask is None else np.asarray(agent_mask,bool)
+        if a.shape!=(len(t),):raise ValueError('agent_mask must have shape [N]')
+        if not self.grid.mask.any():raise ValueError('Grid has no feasible cells')
+        if len(t)==0:t=np.zeros((1,7,3),np.float32);a=np.zeros(1,bool)
+        o=o*self.grid.mask[...,None]
+        with torch.no_grad():
+            v,p,_=self.model(torch.from_numpy(o)[None],torch.from_numpy(t)[None],torch.from_numpy(a)[None],
+                            torch.from_numpy(self.grid.centers.astype(np.float32))[None],torch.from_numpy(self.grid.mask)[None])
+        return FlowForecast(self.grid,v[0].numpy(),p[0].sigmoid().numpy()*self.grid.mask[...,None],epoch=epoch)
+
+    def fit(self,trajectories):
+        """Compatibility inference from [time,s,y] histories; training uses CLI train."""
+        samples=list(trajectories)
+        if not samples: raise ValueError('Need trajectory histories for inference')
+        end=max(float(x[-1,0]) for x in samples); times=np.linspace(end-3,end,7)
+        hist=[]; occupancy=np.zeros(self.grid.shape+(7,),np.float32)
+        for sample in samples:
+            sample=np.asarray(sample)
+            if len(sample)<2 or np.any(np.diff(sample[:,0])<=0): raise ValueError('Need increasing timestamps')
+            pos=np.column_stack([np.interp(times,sample[:,0],sample[:,j]) for j in (1,2)])
+            speed=np.linalg.norm(np.gradient(pos,.5,axis=0),axis=1)
+            hist.append(np.column_stack([pos,speed]))
+            for k,(s,y) in enumerate(pos):
+                ij=self.grid.cell_index(s,y)
+                if ij is not None: occupancy[ij+(k,)]=1
+        return self.predict(occupancy,np.asarray(hist)).field()
+
+
+def main():
+    import argparse,json
+    from pathlib import Path
+    from .learn.data import generate
+    from .learn.training import train,evaluate
+    parser=argparse.ArgumentParser(); sub=parser.add_subparsers(dest='command',required=True)
+    p=sub.add_parser('generate'); p.add_argument('--output',required=True); p.add_argument('--count',type=int,default=256); p.add_argument('--seed',type=int,required=True)
+    p=sub.add_parser('train'); p.add_argument('--train-data',required=True); p.add_argument('--validation-data',required=True); p.add_argument('--checkpoint',required=True); p.add_argument('--epochs',type=int,default=40)
+    p=sub.add_parser('evaluate'); p.add_argument('--data',required=True); p.add_argument('--checkpoint',required=True); p.add_argument('--output')
+    a=parser.parse_args()
+    if a.command=='generate': generate(a.output,a.count,a.seed)
+    elif a.command=='train': train(a.train_data,a.validation_data,a.checkpoint,a.epochs)
+    else:
+        result=evaluate(a.checkpoint,a.data); report=json.dumps(result,indent=2); print(report)
+        if a.output: Path(a.output).write_text(report+'\n')
+
+
+class RoadTravelTimeField:
+    """Geometry adapter: spatial planner queries a world-coordinate learned flow."""
+    def __init__(self,forecast,road,start_s=0.,margin=1.):
+        from scipy.spatial import cKDTree
+        self.forecast=forecast;self.road=road;self.start_s=start_s;self.margin=margin
+        self.grid=forecast.grid
+        self.points=self.grid.centers[self.grid.mask]
+        self.tree=cKDTree(self.points)
+        self.values=forecast.velocity[self.grid.mask]
+
+    def world_velocity(self,xy,k=0):
+        distance,indices=self.tree.query(xy,k=min(4,len(self.points)))
+        weights=1/np.maximum(distance,.1)**2
+        return np.sum(self.values[indices,k]*weights[...,None],axis=-2)/weights.sum(axis=-1,keepdims=True)
+
+    def bounds(self,s):
+        return self.road.bounds(np.asarray(s)+self.start_s,self.margin)
+
+    def lookup(self,s,y):
+        absolute=np.asarray(s)+self.start_s;xy=self.road.world(absolute,y)
+        v=self.world_velocity(xy);forward=np.sum(v*self.road.tangent(absolute),axis=-1)
+        return self.grid.ds/np.maximum(forward,.5)
+
+    def vehicle_arrivals(self,vehicles,stations,max_duration=25.):
+        stations=np.asarray(stations);results=[]
+        for actor in vehicles:
+            s=float(actor['s']);lat=float(actor['y']);now=self.forecast.epoch
+            out=np.full(stations.shape,np.inf);lateral=np.full(stations.shape,lat)
+            if not actor.get('stopped',False):
+                xy=self.road.world(s+self.start_s,lat)
+                for _ in range(int(max_duration/.1)):
+                    k=min(int((now-self.forecast.epoch)/self.forecast.dt),self.forecast.velocity.shape[2]-1)
+                    v=self.world_velocity(xy,k);next_xy=xy+.1*v
+                    ns,nl=self.road.project(next_xy);ns=float(ns)-self.start_s;nl=float(nl)
+                    low,high=self.road.bounds(ns+self.start_s,actor.get('half_width',1.));nl=float(np.clip(nl,low,high))
+                    crossed=(stations>=s)&(stations<=ns)&~np.isfinite(out)
+                    fraction=(stations[crossed]-s)/max(ns-s,1e-9)
+                    out[crossed]=now+.1*fraction;lateral[crossed]=lat+(nl-lat)*fraction
+                    s,lat,now=ns,nl,now+.1;xy=self.road.world(s+self.start_s,lat)
+                    if s>=stations[-1]: break
+            results.append(VehicleArrival(str(actor['id']),stations,out,lateral,actor.get('half_width',1.)))
+        return results
+
+
+if __name__=='__main__': main()

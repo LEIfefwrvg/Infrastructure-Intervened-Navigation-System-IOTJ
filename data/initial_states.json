@@ -1,0 +1,612 @@
+[
+  {
+    "name": "A1C1",
+    "road": "LaneChanging_L.rd5",
+    "ego": {
+      "id": "ego",
+      "s": 110.0,
+      "y": 0.0,
+      "speed": 5.555555555555555
+    },
+    "vehicles": [
+      {
+        "id": "T00",
+        "s": 153.57,
+        "y": -10.338,
+        "speed": 0.8333333333333334,
+        "length": 4.27,
+        "width": 1.75,
+        "route": "0 1",
+        "raw_initial_road": "153.570 -10.338",
+        "maneuvers": {
+          "Man.TreatAtEnd": "Hide",
+          "Man.N": "4",
+          "Man.0.Limit": "t 2",
+          "Man.0.LongDyn": "auto 3",
+          "Man.1.Limit": "t 2",
+          "Man.1.LongDyn": "auto 3",
+          "Man.1.LatDyn": "LaneChange 0 1 0 offset",
+          "Man.2.Limit": "t 5",
+          "Man.2.LongDyn": "auto 3",
+          "Man.3.Limit": "t 999",
+          "Man.3.LongDyn": "auto 10"
+        }
+      },
+      {
+        "id": "T02",
+        "s": 12.07,
+        "y": -0.1,
+        "speed": 0.2777777777777778,
+        "length": 4.27,
+        "width": 1.75,
+        "route": "2 1",
+        "raw_initial_road": "12.070 -0.1",
+        "maneuvers": {
+          "Man.TreatAtEnd": "Hide",
+          "Man.N": "4",
+          "Man.0.Limit": "t 0",
+          "Man.0.LongDyn": "auto 3",
+          "Man.1.Limit": "t 2",
+          "Man.1.LongDyn": "auto 3",
+          "Man.1.LatDyn": "LaneChange 0 0 0 offset",
+          "Man.2.Limit": "t 2",
+          "Man.2.LongDyn": "auto 3",
+          "Man.3.Limit": "t 999",
+          "Man.3.LongDyn": "auto 10"
+        }
+      }
+    ],
+    "unit_notes": "Traffic.SpeedUnit respected; DrivMan.Init.Velocity interpreted as km/h",
+    "raw_ego_start": "110 0 0"
+  },
+  {
+    "name": "A1C2",
+    "road": "LaneChanging_L.rd5",
+    "ego": {
+      "id": "ego",
+      "s": 110.0,
+      "y": 0.0,
+      "speed": 5.555555555555555
+    },
+    "vehicles": [
+      {
+        "id": "T00",
+        "s": 153.57,
+        "y": -10.338,
+        "speed": 0.8333333333333334,
+        "length": 4.27,
+        "width": 1.75,
+        "route": "0 1",
+        "raw_initial_road": "153.570 -10.338",
+        "maneuvers": {
+          "Man.TreatAtEnd": "Hide",
+          "Man.N": "4",
+          "Man.0.Limit": "t 2",
+          "Man.0.LongDyn": "auto 3",
+          "Man.1.Limit": "t 2",
+          "Man.1.LongDyn": "auto 3",
+          "Man.1.LatDyn": "LaneChange 0 1 0 offset",
+          "Man.2.Limit": "t 5",
+          "Man.2.LongDyn": "auto 3",
+          "Man.3.Limit": "t 999",
+          "Man.3.LongDyn": "auto 10"
+        }
+      },
+      {
+        "id": "T02",
+        "s": 12.07,
+        "y": -0.1,
+        "speed": 0.2777777777777778,
+        "length": 4.27,
+        "width": 1.75,
+        "route": "2 1",
+        "raw_initial_road": "12.070 -0.1",
+        "maneuvers": {
+          "Man.TreatAtEnd": "Hide",
+          "Man.N": "4",
+          "Man.0.Limit": "t 0",
+          "Man.0.LongDyn": "auto 3",
+          "Man.1.Limit": "t 2",
+          "Man.1.LongDyn": "auto 3",
+          "Man.1.LatDyn": "LaneChange 0 0 0 offset",
+          "Man.2.Limit": "t 2",
+          "Man.2.LongDyn": "auto 3",
+          "Man.3.Limit": "t 999",
+          "Man.3.LongDyn": "auto 10"
+        }
+      },
+      {
+        "id": "T03",
+        "s": 140.07,
+        "y": -0.1,
+        "speed": 0.8333333333333334,
+        "length": 4.27,
+        "width": 1.75,
+        "route": "1 1",
+        "raw_initial_road": "140.07 -0.1",
+        "maneuvers": {
+          "Man.TreatAtEnd": "FreezePos",
+          "Man.N": "2",
+          "Man.0.Limit": "t 3",
+          "Man.0.LongDyn": "auto 3",
+          "Man.1.Limit": "t 999",
+          "Man.1.LongDyn": "auto 10"
+        }
+      },
+      {
+        "id": "T04",
+        "s": 152.07,
+        "y": 3.0,
+        "speed": 0.8333333333333334,
+        "length": 4.27,
+        "width": 1.75,
+        "route": "1 1",
+        "raw_initial_road": "152.07 3",
+        "maneuvers": {
+          "Man.TreatAtEnd": "FreezePos",
+          "Man.N": "2",
+          "Man.0.Limit": "t 3",
+          "Man.0.LongDyn": "auto 3",
+          "Man.1.Limit": "t 999",
+          "Man.1.LongDyn": "auto 10"
+        }
+      },
+      {
+        "id": "T05",
+        "s": 40.07,
+        "y": 0.0,
+        "speed": 0.0,
+        "length": 4.28,
+        "width": 1.82,
+        "route": "3 1",
+        "raw_initial_road": "40.07 0",
+        "maneuvers": {
+          "Man.TreatAtEnd": "FreezePos",
+          "Man.N": "0"
+        }
+      }
+    ],
+    "unit_notes": "Traffic.SpeedUnit respected; DrivMan.Init.Velocity interpreted as km/h",
+    "raw_ego_start": "110 0 0"
+  },
+  {
+    "name": "A1C3",
+    "road": "LaneChanging_L.rd5",
+    "ego": {
+      "id": "ego",
+      "s": 110.0,
+      "y": 0.0,
+      "speed": 5.555555555555555
+    },
+    "vehicles": [
+      {
+        "id": "T00",
+        "s": 153.57,
+        "y": -10.338,
+        "speed": 0.8333333333333334,
+        "length": 4.27,
+        "width": 1.75,
+        "route": "0 1",
+        "raw_initial_road": "153.570 -10.338",
+        "maneuvers": {
+          "Man.TreatAtEnd": "Hide",
+          "Man.N": "4",
+          "Man.0.Limit": "t 2",
+          "Man.0.LongDyn": "auto 3",
+          "Man.1.Limit": "t 2",
+          "Man.1.LongDyn": "auto 3",
+          "Man.1.LatDyn": "LaneChange 0 1 0 offset",
+          "Man.2.Limit": "t 5",
+          "Man.2.LongDyn": "auto 3",
+          "Man.3.Limit": "t 999",
+          "Man.3.LongDyn": "auto 10"
+        }
+      },
+      {
+        "id": "T02",
+        "s": 12.07,
+        "y": -0.1,
+        "speed": 0.2777777777777778,
+        "length": 4.27,
+        "width": 1.75,
+        "route": "2 1",
+        "raw_initial_road": "12.070 -0.1",
+        "maneuvers": {
+          "Man.TreatAtEnd": "Hide",
+          "Man.N": "4",
+          "Man.0.Limit": "t 0",
+          "Man.0.LongDyn": "auto 3",
+          "Man.1.Limit": "t 2",
+          "Man.1.LongDyn": "auto 3",
+          "Man.1.LatDyn": "LaneChange 0 0 0 offset",
+          "Man.2.Limit": "t 2",
+          "Man.2.LongDyn": "auto 3",
+          "Man.3.Limit": "t 999",
+          "Man.3.LongDyn": "auto 10"
+        }
+      },
+      {
+        "id": "T03",
+        "s": 140.07,
+        "y": -0.5,
+        "speed": 0.8333333333333334,
+        "length": 4.27,
+        "width": 1.75,
+        "route": "1 1",
+        "raw_initial_road": "140.07 -0.5",
+        "maneuvers": {
+          "Man.TreatAtEnd": "FreezePos",
+          "Man.N": "2",
+          "Man.0.Limit": "t 3",
+          "Man.0.LongDyn": "auto 3",
+          "Man.1.Limit": "t 999",
+          "Man.1.LongDyn": "auto 10"
+        }
+      },
+      {
+        "id": "T04",
+        "s": 152.07,
+        "y": 3.0,
+        "speed": 1.6666666666666667,
+        "length": 4.27,
+        "width": 1.75,
+        "route": "1 1",
+        "raw_initial_road": "152.07 3",
+        "maneuvers": {
+          "Man.TreatAtEnd": "FreezePos",
+          "Man.N": "2",
+          "Man.0.Limit": "t 3",
+          "Man.0.LongDyn": "auto 6",
+          "Man.1.Limit": "t 999",
+          "Man.1.LongDyn": "auto 10"
+        }
+      },
+      {
+        "id": "T05",
+        "s": 23.57,
+        "y": 0.0,
+        "speed": 0.8333333333333334,
+        "length": 4.27,
+        "width": 1.75,
+        "route": "4 1",
+        "raw_initial_road": "23.57 0",
+        "maneuvers": {
+          "Man.TreatAtEnd": "FreezePos",
+          "Man.N": "2",
+          "Man.0.Limit": "t 2",
+          "Man.0.LongDyn": "auto 3",
+          "Man.1.Limit": "t 999",
+          "Man.1.LongDyn": "auto 10"
+        }
+      },
+      {
+        "id": "T06",
+        "s": 18.57,
+        "y": 0.0,
+        "speed": 0.8333333333333334,
+        "length": 4.27,
+        "width": 1.75,
+        "route": "3 1",
+        "raw_initial_road": "18.57 0",
+        "maneuvers": {
+          "Man.TreatAtEnd": "FreezePos",
+          "Man.N": "2",
+          "Man.0.Limit": "t 2",
+          "Man.0.LongDyn": "auto 3",
+          "Man.1.Limit": "t 999",
+          "Man.1.LongDyn": "auto 10"
+        }
+      },
+      {
+        "id": "T07",
+        "s": 182.57,
+        "y": 0.0,
+        "speed": 1.6666666666666667,
+        "length": 4.28,
+        "width": 1.82,
+        "route": "1 1",
+        "raw_initial_road": "182.57 0",
+        "maneuvers": {
+          "Man.TreatAtEnd": "FreezePos",
+          "Man.N": "2",
+          "Man.0.Limit": "t 0.0",
+          "Man.0.LongDyn": "auto 6",
+          "Man.1.Limit": "t 100",
+          "Man.1.LongDyn": "auto 10"
+        }
+      }
+    ],
+    "unit_notes": "Traffic.SpeedUnit respected; DrivMan.Init.Velocity interpreted as km/h",
+    "raw_ego_start": "110 0 0"
+  },
+  {
+    "name": "A2C1",
+    "road": "LaneChanging_L.rd5",
+    "ego": {
+      "id": "ego",
+      "s": 110.0,
+      "y": 0.0,
+      "speed": 5.555555555555555
+    },
+    "vehicles": [
+      {
+        "id": "T00",
+        "s": 153.57,
+        "y": -10.338,
+        "speed": 0.8333333333333334,
+        "length": 4.27,
+        "width": 1.75,
+        "route": "0 1",
+        "raw_initial_road": "153.570 -10.338",
+        "maneuvers": {
+          "Man.TreatAtEnd": "Hide",
+          "Man.N": "4",
+          "Man.0.Limit": "t 2",
+          "Man.0.LongDyn": "auto 3",
+          "Man.1.Limit": "t 2",
+          "Man.1.LongDyn": "auto 3",
+          "Man.1.LatDyn": "LaneChange 0 1 0 offset",
+          "Man.2.Limit": "t 5",
+          "Man.2.LongDyn": "auto 3",
+          "Man.3.Limit": "t 999",
+          "Man.3.LongDyn": "auto 10"
+        }
+      },
+      {
+        "id": "T02",
+        "s": 15.07,
+        "y": -0.3,
+        "speed": 0.2777777777777778,
+        "length": 4.27,
+        "width": 1.75,
+        "route": "2 1",
+        "raw_initial_road": "15.070 -0.3",
+        "maneuvers": {
+          "Man.TreatAtEnd": "Hide",
+          "Man.N": "4",
+          "Man.0.Limit": "t 0",
+          "Man.0.LongDyn": "auto 3",
+          "Man.1.Limit": "t 2",
+          "Man.1.LongDyn": "auto 3",
+          "Man.1.LatDyn": "LaneChange 0 0 0 offset",
+          "Man.2.Limit": "t 2",
+          "Man.2.LongDyn": "auto 3",
+          "Man.3.Limit": "t 999",
+          "Man.3.LongDyn": "auto 10"
+        }
+      },
+      {
+        "id": "T03",
+        "s": 162.57,
+        "y": 0.5,
+        "speed": 0.0,
+        "length": 4.88,
+        "width": 1.83,
+        "route": "1 1",
+        "raw_initial_road": "162.57 0.5",
+        "maneuvers": {
+          "Man.TreatAtEnd": "FreezePos",
+          "Man.N": "0"
+        }
+      }
+    ],
+    "unit_notes": "Traffic.SpeedUnit respected; DrivMan.Init.Velocity interpreted as km/h",
+    "raw_ego_start": "110 0 0"
+  },
+  {
+    "name": "A3C1",
+    "road": "LaneChanging_L.rd5",
+    "ego": {
+      "id": "ego",
+      "s": 110.0,
+      "y": 0.0,
+      "speed": 5.555555555555555
+    },
+    "vehicles": [
+      {
+        "id": "T00",
+        "s": 153.57,
+        "y": -10.338,
+        "speed": 0.8333333333333334,
+        "length": 4.27,
+        "width": 1.75,
+        "route": "0 1",
+        "raw_initial_road": "153.570 -10.338",
+        "maneuvers": {
+          "Man.TreatAtEnd": "Hide",
+          "Man.N": "4",
+          "Man.0.Limit": "t 2",
+          "Man.0.LongDyn": "auto 3",
+          "Man.1.Limit": "t 2",
+          "Man.1.LongDyn": "auto 3",
+          "Man.1.LatDyn": "LaneChange 0 1 0 offset",
+          "Man.2.Limit": "t 5",
+          "Man.2.LongDyn": "auto 3",
+          "Man.3.Limit": "t 999",
+          "Man.3.LongDyn": "auto 10"
+        }
+      },
+      {
+        "id": "T02",
+        "s": 13.07,
+        "y": 0.0,
+        "speed": 0.2777777777777778,
+        "length": 4.27,
+        "width": 1.75,
+        "route": "2 1",
+        "raw_initial_road": "13.070 0",
+        "maneuvers": {
+          "Man.TreatAtEnd": "Hide",
+          "Man.N": "4",
+          "Man.0.Limit": "t 0",
+          "Man.0.LongDyn": "auto 3",
+          "Man.1.Limit": "t 2",
+          "Man.1.LongDyn": "auto 3",
+          "Man.1.LatDyn": "LaneChange 0 0 0 offset",
+          "Man.2.Limit": "t 2",
+          "Man.2.LongDyn": "auto 3",
+          "Man.3.Limit": "t 999",
+          "Man.3.LongDyn": "auto 10"
+        }
+      },
+      {
+        "id": "T03",
+        "s": 93.07,
+        "y": 0.0,
+        "speed": 0.0,
+        "length": 4.27,
+        "width": 1.75,
+        "route": "3 1",
+        "raw_initial_road": "93.070 0",
+        "maneuvers": {
+          "Man.TreatAtEnd": "Hide",
+          "Man.N": "2",
+          "Man.0.Limit": "t 15",
+          "Man.0.LongDyn": "auto 0",
+          "Man.1.Limit": "t 999",
+          "Man.1.LongDyn": "auto 10"
+        }
+      },
+      {
+        "id": "T04",
+        "s": 235.57,
+        "y": 0.0,
+        "speed": 0.0,
+        "length": 4.88,
+        "width": 1.83,
+        "route": "0 1",
+        "raw_initial_road": "235.57 0",
+        "maneuvers": {
+          "Man.TreatAtEnd": "FreezePos",
+          "Man.N": "0"
+        }
+      }
+    ],
+    "unit_notes": "Traffic.SpeedUnit respected; DrivMan.Init.Velocity interpreted as km/h",
+    "raw_ego_start": "110 0 0"
+  },
+  {
+    "name": "A4C1",
+    "road": "LaneChanging_L.rd5",
+    "ego": {
+      "id": "ego",
+      "s": 110.0,
+      "y": 0.0,
+      "speed": 5.555555555555555
+    },
+    "vehicles": [
+      {
+        "id": "T00",
+        "s": 153.57,
+        "y": -10.338,
+        "speed": 0.8333333333333334,
+        "length": 4.27,
+        "width": 1.75,
+        "route": "0 1",
+        "raw_initial_road": "153.570 -10.338",
+        "maneuvers": {
+          "Man.TreatAtEnd": "Hide",
+          "Man.N": "4",
+          "Man.0.Limit": "t 2",
+          "Man.0.LongDyn": "auto 3",
+          "Man.1.Limit": "t 2",
+          "Man.1.LongDyn": "auto 3",
+          "Man.1.LatDyn": "LaneChange 0 1 0 offset",
+          "Man.2.Limit": "t 5",
+          "Man.2.LongDyn": "auto 3",
+          "Man.3.Limit": "t 999",
+          "Man.3.LongDyn": "auto 10"
+        }
+      },
+      {
+        "id": "T02",
+        "s": 11.07,
+        "y": -0.1,
+        "speed": 0.2777777777777778,
+        "length": 4.27,
+        "width": 1.75,
+        "route": "2 1",
+        "raw_initial_road": "11.070 -0.1",
+        "maneuvers": {
+          "Man.TreatAtEnd": "Hide",
+          "Man.N": "4",
+          "Man.0.Limit": "t 0",
+          "Man.0.LongDyn": "auto 3",
+          "Man.1.Limit": "t 2",
+          "Man.1.LongDyn": "auto 3",
+          "Man.1.LatDyn": "LaneChange 0 0 0 offset",
+          "Man.2.Limit": "t 2",
+          "Man.2.LongDyn": "auto 3",
+          "Man.3.Limit": "t 999",
+          "Man.3.LongDyn": "auto 10"
+        }
+      },
+      {
+        "id": "T03",
+        "s": 93.07,
+        "y": 0.0,
+        "speed": 0.0,
+        "length": 4.27,
+        "width": 1.75,
+        "route": "4 1",
+        "raw_initial_road": "93.070 0",
+        "maneuvers": {
+          "Man.TreatAtEnd": "Hide",
+          "Man.N": "2",
+          "Man.0.Limit": "t 12",
+          "Man.0.LongDyn": "auto 0",
+          "Man.1.Limit": "t 999",
+          "Man.1.LongDyn": "auto 10"
+        }
+      },
+      {
+        "id": "T05",
+        "s": 224.07,
+        "y": 0.0,
+        "speed": 0.0,
+        "length": 4.27,
+        "width": 1.75,
+        "route": "1 1",
+        "raw_initial_road": "224.070 0",
+        "maneuvers": {
+          "Man.TreatAtEnd": "Hide",
+          "Man.N": "2",
+          "Man.0.Limit": "t 13",
+          "Man.0.LongDyn": "auto 0",
+          "Man.1.Limit": "t 999",
+          "Man.1.LongDyn": "auto 10"
+        }
+      },
+      {
+        "id": "T04",
+        "s": 235.57,
+        "y": 0.0,
+        "speed": 0.0,
+        "length": 4.88,
+        "width": 1.83,
+        "route": "0 1",
+        "raw_initial_road": "235.57 0",
+        "maneuvers": {
+          "Man.TreatAtEnd": "FreezePos",
+          "Man.N": "0"
+        }
+      },
+      {
+        "id": "T03",
+        "s": 161.57,
+        "y": 0.5,
+        "speed": 0.0,
+        "length": 4.88,
+        "width": 1.83,
+        "route": "1 1",
+        "raw_initial_road": "161.57 0.5",
+        "maneuvers": {
+          "Man.TreatAtEnd": "FreezePos",
+          "Man.N": "0"
+        }
+      }
+    ],
+    "unit_notes": "Traffic.SpeedUnit respected; DrivMan.Init.Velocity interpreted as km/h",
+    "raw_ego_start": "110 0 0"
+  }
+]
