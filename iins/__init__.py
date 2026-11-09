@@ -7,6 +7,7 @@ _MODULES = {
     'LocalPath':'local_refinement','LocalRefinementConfig':'local_refinement','SpatialMPCRefiner':'local_refinement',
     'GridSpec':'travel_time','GridTravelTimeEstimator':'travel_time','TravelTimeField':'travel_time',
     'FlowForecast':'travel_time','VehicleArrival':'travel_time',
+    'RoadTravelTimeField':'travel_time','estimate_ego_arrival_times':'travel_time',
 }
 __all__=list(_MODULES)
 

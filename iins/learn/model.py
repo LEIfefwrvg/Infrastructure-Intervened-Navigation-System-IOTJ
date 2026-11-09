@@ -7,9 +7,37 @@ def encoder(width,layers=1):
     return nn.TransformerEncoder(nn.TransformerEncoderLayer(width,4,width*2,dropout=0.,batch_first=True),layers,enable_nested_tensor=False)
 
 
+class GaussianLatentBottleneck(nn.Module):
+    """History-conditioned diagonal Gaussian, regularized toward N(0,I).
+    """
+    def __init__(self, width, latent_dim):
+        super().__init__()
+        self.mu=nn.Linear(width,latent_dim)
+        self.logvar=nn.Linear(width,latent_dim)
+        self.decoder=nn.Sequential(nn.Linear(latent_dim,width),nn.GELU(),nn.LayerNorm(width))
+
+    def encode(self, features):
+        return self.mu(features),self.logvar(features).clamp(-8.,4.)
+
+    def forward(self, features, mask, sample=False):
+        mu,logvar=self.encode(features)
+        z=mu+torch.exp(.5*logvar)*torch.randn_like(mu) if sample else mu
+        # Sum latent dimensions, then mean only over feasible cell-times.
+        per_token=.5*(mu.square()+logvar.exp()-1.-logvar).sum(-1)
+        weight=mask.to(per_token.dtype)
+        kl=(per_token*weight).sum()/weight.sum().clamp_min(1.)
+        decoded=self.decoder(z)*weight[...,None]
+        return decoded,kl
+
+
 class SpatioTemporalFlowPredictor(nn.Module):
-    def __init__(self,history=7,future=6,width=48):
-        super().__init__();self.config=dict(history=history,future=future,width=width);self.future=future;self.width=width
+    def __init__(self,history=7,future=6,width=48,latent_dim=0,speed_scale_mps=None):
+        super().__init__();self.config=dict(history=history,future=future,width=width,latent_dim=latent_dim,speed_scale_mps=speed_scale_mps);self.future=future;self.width=width
+        if latent_dim<0: raise ValueError("latent_dim must be nonnegative")
+        if speed_scale_mps is not None and not (0 < speed_scale_mps < float("inf")):
+            raise ValueError("speed_scale_mps must be finite and positive")
+        self.speed_scale_mps=speed_scale_mps
+        self.latent_dim=latent_dim
         self.actor_input=nn.Linear(7,width);self.temporal_position=nn.Parameter(torch.randn(1,history,width)*.02)
         self.temporal=encoder(width,2);self.social=encoder(width)
         self.motion=nn.Sequential(nn.Linear(width,width),nn.GELU(),nn.Linear(width,future*2))
@@ -20,6 +48,10 @@ class SpatioTemporalFlowPredictor(nn.Module):
         self.query=nn.Linear(width,width);self.key=nn.Linear(width,width)
         self.future_position=nn.Parameter(torch.randn(future,width)*.02)
         self.residual=nn.Linear(width,2);self.occupancy=nn.Linear(width,1)
+        self.latent=GaussianLatentBottleneck(width,latent_dim) if latent_dim else None
+        self.speed_head=nn.Linear(width,1) if speed_scale_mps is not None else None
+        if self.speed_head is not None:
+            nn.init.zeros_(self.speed_head.weight);nn.init.zeros_(self.speed_head.bias)
         nn.init.zeros_(self.residual.weight);nn.init.zeros_(self.residual.bias)
         nn.init.zeros_(self.motion[-1].weight);nn.init.zeros_(self.motion[-1].bias)
 
@@ -41,7 +73,7 @@ class SpatioTemporalFlowPredictor(nn.Module):
         fused=fine+F.interpolate(coarse,(h,w),mode='bilinear',align_corners=False)+F.interpolate(deep,(h,w),mode='bilinear',align_corners=False)
         return fused.flatten(2).transpose(1,2)
 
-    def forward(self,occupancy,trajectories,agent_mask,centers,feasible):
+    def forward(self,occupancy,trajectories,agent_mask,centers,feasible,latent_sample=None):
         b,h,w,th=occupancy.shape;n=trajectories.shape[1]
         # Translation invariance; speed differences and per-step displacement remain physical.
         pos=trajectories[...,:2];delta=torch.diff(pos,dim=2,prepend=pos[:,:,:1])/.5
@@ -86,7 +118,20 @@ class SpatioTemporalFlowPredictor(nn.Module):
         transported=transported.reshape(b,self.future,self.width,h*w).permute(0,3,1,2)
         visual_time=visual[:,:,None]+transported
         fused=self.fusion(torch.cat([visual_time,context],-1))+self.future_position
+        kl=fused.new_zeros(())
+        if self.latent is not None:
+            mask=feasible.flatten(1)[:,:,None].expand(-1,-1,self.future)
+            fused,kl=self.latent(fused,mask,sample=self.training if latent_sample is None else latent_sample)
         flow=motion+self.residual(fused)
+        if self.speed_head is not None:
+            # Bounded scalar speed, with direction retained in world coordinates.
+            magnitude=torch.linalg.vector_norm(flow,dim=-1,keepdim=True)
+            direction=flow/magnitude.clamp_min(1e-8)
+            fallback=torch.zeros_like(direction);fallback[...,0]=1.
+            direction=torch.where(magnitude>1e-8,direction,fallback)
+            prior=(torch.linalg.vector_norm(motion,dim=-1)/self.speed_scale_mps).clamp(1e-4,1-1e-4)
+            speed_logits=torch.logit(prior)+self.speed_head(fused).squeeze(-1)
+            flow=direction*(self.speed_scale_mps*speed_logits.sigmoid())[...,None]
         occ=self.occupancy(fused).squeeze(-1)-dist.min(2).values
         flow=flow.reshape(b,h,w,self.future,2)*feasible[...,None,None]
-        return flow,occ.reshape(b,h,w,self.future),flow.new_zeros(())
+        return flow,occ.reshape(b,h,w,self.future),kl

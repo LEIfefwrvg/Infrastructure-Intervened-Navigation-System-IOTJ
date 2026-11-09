@@ -4,17 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Sequence
-import warnings
 import time
 from functools import wraps
 
 import numpy as np
-from scipy.optimize import OptimizeResult, minimize
 
-from .travel_time import TravelTimeField
-from .warm_start import remap_controls
-from .spatial_dynamics import spatial_rollout
-from .sequential_qp import solve_sequential_qp
+from .travel_time import TravelTimeField, estimate_ego_arrival_times
 
 
 Array = np.ndarray
@@ -28,6 +23,7 @@ class ObstacleProfile:
     s: Array
     y: Array
     safe_squared_distance: float = 4.0
+    vehicle_id: str | None = None
 
     def __post_init__(self) -> None:
         s = np.asarray(self.s, dtype=float)
@@ -53,12 +49,11 @@ class ObstacleProfile:
 
 @dataclass(frozen=True)
 class GlobalPlannerConfig:
-    solver: str = "scp"
-    scp_max_iterations: int = 80
-    scp_qp_max_iterations: int = 4000
-    scp_max_seeds: int = 3
-    scp_trust_radius: float = 1.0
-    scp_penalty: float = 10.0
+    solver: str = "psd_dispatch"
+    dispatch_sqp_time_limit: float = .08
+    dispatch_bnb_time_limit: float = .015
+    dispatch_bnb_node_limit: int = 64
+    dispatch_bnb_relative_gap: float = .01
     horizon: int = 60
     ds: float = 1.0
     control_step: float = DEFAULT_GLOBAL_CONTROL_STEP_M
@@ -69,22 +64,29 @@ class GlobalPlannerConfig:
     heading_weight: float = 10.0
     travel_time_weight: float = 100.0
     cbf_gamma: float = 0.5
+    cbf_arrival_tolerance: float = 1.0  # seconds; same absolute clock for all ETAs
     max_iterations: int = 200
     feasibility_tolerance: float = 1e-4
     coarse_factor: int = 5
     variable_steps: bool = True
 
     def __post_init__(self) -> None:
-        if self.solver not in ("scp", "slsqp"):
-            raise ValueError("solver must be scp or slsqp")
-        if min(self.scp_max_iterations,self.scp_qp_max_iterations,self.scp_max_seeds)<1 or not np.isfinite([self.scp_trust_radius,self.scp_penalty]).all() or min(self.scp_trust_radius,self.scp_penalty)<=0:
-            raise ValueError("Invalid SCP settings")
-        if not np.isfinite(self.control_step) or self.control_step <= 0:
-            raise ValueError("control_step must be finite and positive")
-        if self.horizon < 2 or self.ds <= 0 or self.wheelbase <= 0:
-            raise ValueError("horizon, ds, and wheelbase must be positive")
-        if self.steering_min >= self.steering_max:
-            raise ValueError("steering_min must be smaller than steering_max")
+        if self.solver != "psd_dispatch":
+            raise ValueError("Only psd_dispatch is supported")
+        positive = (self.ds, self.wheelbase, self.control_step,
+                    self.dispatch_sqp_time_limit, self.dispatch_bnb_time_limit)
+        if not np.isfinite(positive).all() or min(positive) <= 0:
+            raise ValueError("Spatial scales and time budgets must be finite and positive")
+        if not np.isfinite(self.cbf_arrival_tolerance) or self.cbf_arrival_tolerance < 0:
+            raise ValueError("CBF arrival tolerance must be finite and nonnegative")
+        counts = (self.horizon - 1, self.dispatch_bnb_node_limit, self.max_iterations)
+        if not np.isfinite(counts).all() or min(counts) < 1:
+            raise ValueError("horizon must be >= 2; iteration and node limits must be >= 1")
+        if not np.isfinite(self.dispatch_bnb_relative_gap) or self.dispatch_bnb_relative_gap < 0:
+            raise ValueError("Relative gap must be finite and nonnegative")
+        if not np.isfinite((self.steering_min, self.steering_max)).all() or self.steering_min >= self.steering_max:
+            raise ValueError("Steering bounds must be finite and increasing")
+
 
 
 @dataclass(frozen=True)
@@ -108,7 +110,11 @@ def variable_step_indices(ego_times, obstacle_times, coarse_factor=5):
     no finite nonnegative time difference, keep the full horizon conservatively.
     """
     ego_times=np.asarray(ego_times,dtype=float)
+    if ego_times.ndim!=1 or len(ego_times)<2 or np.isnan(ego_times).any() or np.isneginf(ego_times).any():
+        raise ValueError('Ego arrivals must be a one-dimensional array of times or +inf')
     n=len(ego_times); stars=[]
+    if not np.isfinite(ego_times).all():return np.arange(n),n-1
+    if np.any(np.diff(ego_times)<0):raise ValueError('Ego arrivals must be nondecreasing')
     if coarse_factor < 1: raise ValueError('coarse_factor must be >= 1')
     for times in obstacle_times:
         times=np.asarray(times,dtype=float)
@@ -150,7 +156,7 @@ def _timed_plan(method):
 
 
 class SpatialGlobalPlanner:
-    """Spatial planner using sequential convexification, with optional legacy SLSQP."""
+    """Spatial planner using PSD dispatch to SQP or limited spatial B&B."""
 
     def __init__(self, travel_time: TravelTimeField, config: GlobalPlannerConfig | None = None):
         self.travel_time = travel_time
@@ -168,7 +174,7 @@ class SpatialGlobalPlanner:
         ds = np.diff(self.stations)
         rate = np.asarray(steering) / self.config.wheelbase - curvature
         heading = np.r_[self.initial_heading, self.initial_heading + np.cumsum(rate * ds)]
-        y = np.r_[self.initial_y, self.initial_y + np.cumsum(heading[:-1] * ds + .5 * rate * ds**2)]
+        y = np.r_[self.initial_y, self.initial_y + np.cumsum(heading[:-1] * ds)]
         return self.stations, y, heading
 
     def _objective(self, steering: Array, curvature: Array) -> float:
@@ -178,6 +184,59 @@ class SpatialGlobalPlanner:
         return float(
             np.sum(cfg.steering_weight * steering**2 * np.diff(s) + cfg.heading_weight * heading[:-1]**2 * np.diff(s) + cfg.travel_time_weight * cell_time * np.diff(s)/self.travel_time.grid.ds)
         )
+
+    def _obstacle_cbf_active(self, obstacle):
+        """Profiles passed to the solver already contain only ETA-active intervals."""
+        return obstacle.active_at(self.stations)
+
+    def _obstacle_arrival_mask(self, obstacle, vehicles, stations, ego_times):
+        """Match by ID, or uniquely by geometry for legacy callers; unknown stays active.
+
+        The mask is fixed from the reference-path ETA for this planning call.
+        Missing/nonfinite ETAs do not establish temporal separation.
+        """
+        if obstacle.vehicle_id is not None:
+            matches = [v for v in vehicles if v.vehicle_id == obstacle.vehicle_id]
+        else:
+            matches = []
+            for vehicle in vehicles:
+                covered = ((obstacle.s >= vehicle.stations[0]) &
+                           (obstacle.s <= vehicle.stations[-1]))
+                if covered.all() and np.allclose(
+                    obstacle.y, np.interp(obstacle.s, vehicle.stations, vehicle.lateral),
+                    rtol=0., atol=1e-6,
+                ):
+                    matches.append(vehicle)
+        valid = obstacle.active_at(stations)
+        if len(matches) != 1:
+            return valid
+        vehicle = matches[0]
+        other = np.interp(stations, vehicle.stations, vehicle.times,
+                          left=np.inf, right=np.inf)
+        known = np.isfinite(ego_times) & np.isfinite(other)
+        close = np.ones(len(stations), dtype=bool)
+        close[known] = (np.abs(ego_times[known] - other[known]) <=
+                        self.config.cbf_arrival_tolerance)
+        return valid & close
+
+    def _arrival_filtered_obstacles(self, obstacles, masks):
+        """Split active interval runs so SQP and B&B use identical CBF rows.
+
+        A spatial CBF uses two endpoints: enable it if either endpoint is
+        temporally close (or unknown), provided both lie in the obstacle domain.
+        Splitting prevents a gap between two conflicts from acquiring extra rows.
+        """
+        result = []
+        for obstacle, full_mask in zip(obstacles, masks):
+            close = full_mask[self.control_indices]
+            valid = obstacle.active_at(self.stations)
+            active = valid[:-1] & valid[1:] & (close[:-1] | close[1:])
+            edges = np.diff(np.r_[False, active, False].astype(int))
+            for first, stop in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
+                stations = self.stations[first:stop + 1]
+                result.append(ObstacleProfile(stations, obstacle.lateral_at(stations),
+                                              obstacle.safe_squared_distance, obstacle.vehicle_id))
+        return tuple(result)
 
     def _cbf_constraints(
         self, steering: Array, curvature: Array, obstacles: Sequence[ObstacleProfile]
@@ -189,18 +248,16 @@ class SpatialGlobalPlanner:
             obstacle_y = obstacle.lateral_at(s)
             energy = (y - obstacle_y) ** 2 - obstacle.safe_squared_distance
             spatial_cbf = np.diff(energy) / np.diff(s) + self.config.cbf_gamma * energy[:-1]
-            active = obstacle.active_at(s)
+            active = self._obstacle_cbf_active(obstacle)
             transition_active = active[:-1] & active[1:]
-            if np.any(active):
-                constraints.append(energy[active])
             if np.any(transition_active):
                 constraints.append(spatial_cbf[transition_active])
         return np.concatenate(constraints) if constraints else np.ones(1, dtype=float)
 
     def _lateral_jacobian(self,query):
-        d1=np.maximum(np.asarray(query)[:,None]-self.stations[:-1],0.)
-        d2=np.maximum(np.asarray(query)[:,None]-self.stations[1:],0.)
-        return (d1*d1-d2*d2)/(2*self.config.wheelbase)
+        # Euler steering affects heading at the next node, then lateral position.
+        distance=np.maximum(np.asarray(query)[:,None]-self.stations[1:],0.)
+        return distance*np.diff(self.stations)[None,:]/self.config.wheelbase
 
     def _objective_jac(self,steering,curvature):
         s,y,heading=self._rollout(steering,curvature); ds=np.diff(s); eps=1e-5
@@ -213,22 +270,9 @@ class SpatialGlobalPlanner:
         rows=[jac,-jac]
         for obstacle in obstacles:
             derivative=2*(y-obstacle.lateral_at(s))[:,None]*jac
-            active=obstacle.active_at(s); transitions=active[:-1]&active[1:]
-            if active.any(): rows.append(derivative[active])
+            active=self._obstacle_cbf_active(obstacle); transitions=active[:-1]&active[1:]
             if transitions.any(): rows.append((np.diff(derivative,axis=0)/np.diff(s)[:,None]+self.config.cbf_gamma*derivative[:-1])[transitions])
         return np.concatenate(rows)
-
-    def _candidate_seeds(self, initial: Array | None) -> list[Array]:
-        cfg = self.config
-        if initial is not None:
-            seed = np.asarray(initial, dtype=float)
-            if seed.shape != ((len(self.stations)-1),):
-                raise ValueError(f"initial_steering must have shape ({(len(self.stations)-1)},)")
-            return [np.clip(seed, cfg.steering_min, cfg.steering_max)]
-        zeros = np.zeros((len(self.stations)-1), dtype=float)
-        bend = np.sin(np.linspace(0.0, 2.0 * np.pi, (len(self.stations)-1), endpoint=False))
-        amplitude = 0.35 * min(abs(cfg.steering_min), abs(cfg.steering_max))
-        return [zeros, amplitude * bend, -amplitude * bend]
 
     @_timed_plan
     def plan(
@@ -239,6 +283,8 @@ class SpatialGlobalPlanner:
         initial_steering: Array | None = None,
         ego_arrival_times: Array | None = None,
         vehicle_arrivals=(),
+        reference_y: Array | None = None,
+        arrival_epoch: float | None = None,
         start_s: float = 0.,
         initial_y: float = 0.,
         initial_heading: float = 0.,
@@ -247,198 +293,57 @@ class SpatialGlobalPlanner:
         cfg = self.config
         self.initial_y=initial_y; self.initial_heading=initial_heading
         full_s=start_s+np.arange(cfg.horizon+1)*cfg.ds
-        if cfg.variable_steps and ego_arrival_times is not None:
+        self.last_ego_arrival_times=None;self.last_arrival_reference_y=None
+        self.arrival_time_source='disabled'
+        obstacles=tuple(obstacles); vehicle_arrivals=tuple(vehicle_arrivals)
+        if cfg.variable_steps or obstacles:
+            if ego_arrival_times is None:
+                if reference_y is not None:
+                    reference=np.asarray(reference_y,dtype=float)
+                    self.arrival_time_source='travel-time field / explicit reference'
+                elif previous_path is not None and previous_path.success:
+                    reference=np.interp(full_s,previous_path.s,previous_path.y)
+                    before=full_s<previous_path.s[0];after=full_s>previous_path.s[-1]
+                    reference[before]=previous_path.y[0]+(full_s[before]-previous_path.s[0])*previous_path.heading[0]
+                    reference[after]=previous_path.y[-1]+(full_s[after]-previous_path.s[-1])*previous_path.heading[-1]
+                    reference+=initial_y-reference[0]
+                    self.arrival_time_source='travel-time field / previous path (reanchored, heading-extended)'
+                else:
+                    reference=initial_y+(full_s-full_s[0])*initial_heading
+                    self.arrival_time_source='travel-time field / current-heading reference'
+                if reference.shape!=full_s.shape or not np.isclose(reference[0],initial_y):
+                    raise ValueError('Arrival reference must cover the full grid and start at initial_y')
+                ego_arrival_times=estimate_ego_arrival_times(self.travel_time,full_s,reference,epoch=arrival_epoch)
+                self.last_arrival_reference_y=reference.copy()
+            else:
+                self.arrival_time_source='caller-supplied override'
+            ego_arrival_times=np.asarray(ego_arrival_times,dtype=float)
+            if ego_arrival_times.shape!=full_s.shape:raise ValueError('Ego arrivals must match full global grid')
+            self.last_ego_arrival_times=ego_arrival_times.copy()
             arrivals=[]
             for vehicle in vehicle_arrivals:
                 if not np.allclose(vehicle.stations,full_s): raise ValueError('Arrival stations must match full global grid')
                 arrivals.append(vehicle.times)
-            self.control_indices,self.k_star=variable_step_indices(ego_arrival_times,arrivals,cfg.coarse_factor)
+            if cfg.variable_steps:
+                self.control_indices,self.k_star=variable_step_indices(ego_arrival_times,arrivals,cfg.coarse_factor)
+            else:
+                self.control_indices=np.arange(cfg.horizon+1); self.k_star=cfg.horizon
         else:
             self.control_indices=np.arange(cfg.horizon+1); self.k_star=cfg.horizon
+        masks=[self._obstacle_arrival_mask(o,vehicle_arrivals,full_s,ego_arrival_times)
+               for o in obstacles]
+        # Retain each conflict and its adjacent full-grid nodes, even beyond k_star.
+        for mask in masks:
+            nodes=np.flatnonzero(mask)
+            neighbors=np.clip(np.r_[nodes-1,nodes,nodes+1],0,cfg.horizon)
+            self.control_indices=np.union1d(self.control_indices,neighbors).astype(int)
         self.stations=full_s[self.control_indices]
+        self.cbf_obstacles=self._arrival_filtered_obstacles(obstacles,masks)
         curvature_array = self._curvature(curvature)
         expansion=control_blocks(self.stations,cfg.control_step)
-        reduced=expansion.shape[1] < expansion.shape[0]
         self.control_expansion=expansion
-        bounds = [(cfg.steering_min, cfg.steering_max)] * expansion.shape[1]
-        if reduced:
-            lengths=np.diff(self.stations)
-            projection=(expansion.T*lengths)/(expansion.T@lengths)[:,None]
-            objective=lambda u,curv:self._objective(expansion@u,curv)
-            objective_jac=lambda u,curv:expansion.T@self._objective_jac(expansion@u,curv)
-            constraints=lambda u,curv,obs:self._cbf_constraints(expansion@u,curv,obs)
-            constraints_jac=lambda u,curv,obs:self._cbf_jac(expansion@u,curv,obs)@expansion
-        else:
-            objective=self._objective;objective_jac=self._objective_jac
-            constraints=self._cbf_constraints;constraints_jac=self._cbf_jac
-        if cfg.solver == "scp":
-            return self._plan_scp(curvature_array,obstacles,initial_steering,previous_path,expansion)
-        best: OptimizeResult | None = None
-        best_violation = np.inf
-        best_rank: tuple[bool, bool, float, float] | None = None
-
-        self.last_diagnostics=[]
-        seeds=self._candidate_seeds(initial_steering)
-        if initial_steering is None:
-            seeds=[np.clip(seed+curvature_array*cfg.wheelbase,cfg.steering_min,cfg.steering_max) for seed in seeds]
-        self.warm_start_used=False
-        if previous_path is not None and previous_path.success:
-            warm,self.warm_start_used=remap_controls(previous_path.s,previous_path.steering,self.stations,curvature_array*cfg.wheelbase)
-            if self.warm_start_used:seeds.insert(0,np.clip(warm,cfg.steering_min,cfg.steering_max))
-        for seed_index,seed in enumerate(seeds):
-            if reduced:seed=projection@seed
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message="Values in x were outside bounds during a minimize step",
-                    category=RuntimeWarning,
-                )
-                solve_started=time.perf_counter()
-                result = minimize(
-                    objective,
-                    seed,
-                    args=(curvature_array,),
-                    jac=objective_jac,
-                    method="SLSQP",
-                    bounds=bounds,
-                    constraints=[
-                        {
-                            "type": "ineq",
-                            "fun": constraints,
-                            "jac": constraints_jac,
-                            "args": (curvature_array, obstacles),
-                        }
-                    ],
-                    options={"maxiter": cfg.max_iterations, "ftol": 1e-7, "disp": False},
-                )
-            solve_elapsed=time.perf_counter()-solve_started
-            if reduced:result.x=expansion@result.x
-            violation = max(0.0, -float(np.min(self._cbf_constraints(result.x, curvature_array, obstacles))))
-            self.last_diagnostics.append(dict(solve_time_s=solve_elapsed,iterations=int(getattr(result,"nit",0)),solver_success=bool(result.success),message=str(result.message),violation=violation,variables=len(seed),state_intervals=len(self.stations)-1,constraints=len(self._cbf_constraints(result.x,curvature_array,obstacles)),control_step_m=cfg.control_step))
-            rank = (
-                violation > cfg.feasibility_tolerance,
-                not bool(result.success),
-                violation,
-                float(result.fun),
-            )
-            if best_rank is None or rank < best_rank:
-                best = result
-                best_violation = violation
-                best_rank = rank
-            if self.warm_start_used and seed_index==0 and result.success and violation<=cfg.feasibility_tolerance:
-                break
-
-        assert best is not None
-        s, y, heading = self._rollout(best.x, curvature_array)
-        cell_time = self.travel_time.lookup(s[:-1], y[:-1])
-        feasible = best_violation <= cfg.feasibility_tolerance
-        return GlobalPath(
-            s=s,
-            wheelbase=cfg.wheelbase,
-            y=y,
-            heading=heading,
-            steering=np.asarray(best.x, dtype=float),
-            curvature=curvature_array,
-            objective=float(best.fun),
-            success=bool(best.success and feasible),
-            message=str(best.message) if feasible else f"CBF violation: {best_violation:.3g}",
-            travel_time=np.asarray(cell_time, dtype=float)*np.diff(s)/self.travel_time.grid.ds,
-        )
-
-
-    def _plan_scp(self,curvature,obstacles,initial,previous,expansion):
-        cfg=self.config;ds=np.diff(self.stations);n=expansion.shape[1]
-        projection=(expansion.T*ds)/(expansion.T@ds)[:,None]
-        full_jac=self._lateral_jacobian(self.stations);gmap=full_jac@expansion
-        bounds=np.tile([cfg.steering_min,cfg.steering_max],(n,1))
-        self.last_diagnostics=[];self.warm_start_used=False;self.last_retry_diagnostics=[]
-        lower,upper=self.travel_time.bounds(self.stations)
-        lower=np.broadcast_to(lower,self.stations.shape);upper=np.broadcast_to(upper,self.stations.shape)
-        immutable_violation=max(0.,float(lower[0]-self.initial_y),float(self.initial_y-upper[0]))
-        for obstacle in obstacles:
-            if obstacle.active_at(self.stations[:1])[0]:
-                immutable_violation=max(immutable_violation,float(obstacle.safe_squared_distance-(self.initial_y-obstacle.lateral_at(self.stations[:1])[0])**2))
-        if immutable_violation>cfg.feasibility_tolerance:
-            u=np.clip(curvature*cfg.wheelbase,cfg.steering_min,cfg.steering_max)
-            self.last_diagnostics.append(dict(solver='precheck',solve_time_s=0.,iterations=0,solver_success=False,
-                message='Initial state violates an immutable constraint',violation=immutable_violation,
-                variables=n,constraints=len(self._cbf_constraints(u,curvature,obstacles)),qp_solves=0,qp_events=[]))
-            return self._global_path(u,curvature,False,'Initial state infeasible',self._objective(u,curvature))
-        # Cache fixed geometry and interval maps only inside this planning call.
-        base=self._rollout(np.zeros(len(ds)),curvature)[1]
-        obstacle_data=[(o,o.lateral_at(self.stations),o.active_at(self.stations)) for o in obstacles]
-        constraint_scale=[np.ones(2*len(self.stations))]
-        for obstacle,_,active in obstacle_data:
-            scale=max(1.,2*np.sqrt(obstacle.safe_squared_distance))
-            if active.any():constraint_scale.append(np.full(np.count_nonzero(active),scale))
-            transition=active[:-1]&active[1:]
-            if transition.any():constraint_scale.append(np.full(np.count_nonzero(transition),scale))
-        constraint_scale=np.concatenate(constraint_scale)
-        def objective(u):return self._objective(expansion@u,curvature)
-        def gradient(u):return expansion.T@self._objective_jac(expansion@u,curvature)
-        def constraints(u):
-            y=base+gmap@u;rows=[y-lower,upper-y]
-            for obstacle,oy,active in obstacle_data:
-                energy=(y-oy)**2-obstacle.safe_squared_distance;transition=active[:-1]&active[1:]
-                if active.any():rows.append(energy[active])
-                if transition.any():rows.append((np.diff(energy)/ds+cfg.cbf_gamma*energy[:-1])[transition])
-            return np.concatenate(rows)
-        def jacobian(u):
-            y=base+gmap@u;rows=[gmap,-gmap]
-            for obstacle,oy,active in obstacle_data:
-                derivative=2*(y-oy)[:,None]*gmap;transition=active[:-1]&active[1:]
-                if active.any():rows.append(derivative[active])
-                if transition.any():rows.append((np.diff(derivative,axis=0)/ds[:,None]+cfg.cbf_gamma*derivative[:-1])[transition])
-            return np.concatenate(rows)
-        candidates=[]
-        feed=curvature*cfg.wheelbase
-        if previous is not None and previous.success:
-            warm,self.warm_start_used=remap_controls(previous.s,previous.steering,self.stations,feed)
-            if self.warm_start_used:candidates.append(('warm',projection@warm))
-        if initial is not None:
-            candidates.append(('explicit',projection@self._candidate_seeds(initial)[0]))
-        else:
-            candidates.append(('feedforward',projection@feed))
-            length=self.stations[-1]-self.stations[0]
-            bend=np.sin(2*np.pi*(self.stations[:-1]-self.stations[0])/length)
-            amplitude=min(.35*min(abs(cfg.steering_min),abs(cfg.steering_max)),2*np.pi*cfg.wheelbase*3.5/length**2)
-            candidates.extend((label,projection@(feed+sign*amplitude*bend)) for label,sign in (('left',-1),('right',1)))
-        unique=[]
-        for label,seed in candidates:
-            seed=np.clip(seed,bounds[:,0],bounds[:,1])
-            if any(np.max(np.abs(gmap@(seed-other)))<1e-6 for _,other in unique):
-                self.last_retry_diagnostics.append(dict(seed=label,reason='duplicate predicted path'));continue
-            if label=='feedforward' and np.any((constraints(seed)<-cfg.feasibility_tolerance)&(np.linalg.norm(jacobian(seed),axis=1)<1e-10)):
-                self.last_retry_diagnostics.append(dict(seed=label,reason='violated constraint has zero local gradient'));continue
-            unique.append((label,seed))
-        # Prefer feasible / near-feasible seeds; retain the measured warm start first.
-        unique.sort(key=lambda item:(item[0]!='warm',float(np.maximum(-constraints(item[1]),0.).sum())))
-        self.last_retry_diagnostics.extend(dict(seed=name,reason='seed budget') for name,_ in unique[cfg.scp_max_seeds:])
-        best=None;best_rank=None
-        hessian=2*cfg.steering_weight*expansion.T@(ds[:,None]*expansion)
-        hj=np.minimum(np.maximum(self.stations[:-1,None]-self.stations[None,:-1],0.),ds[None,:])/cfg.wheelbase@expansion
-        hessian+=2*cfg.heading_weight*hj.T@(ds[:,None]*hj)
-        attempted_candidates=unique[:cfg.scp_max_seeds]
-        for index,(label,seed) in enumerate(attempted_candidates):
-            started=time.perf_counter()
-            result=solve_sequential_qp(objective,gradient,constraints,jacobian,seed,bounds,gmap,hessian,cfg,constraint_scale)
-            elapsed=time.perf_counter()-started
-            steering=expansion@result.x
-            # Always check the original rollout/CBF, independently of the affine cache.
-            raw=self._cbf_constraints(steering,curvature,obstacles)
-            violation=max(0.,-float(np.min(raw)),float(np.max(cfg.steering_min-steering)),float(np.max(steering-cfg.steering_max))) if np.isfinite(raw).all() and np.isfinite(steering).all() else np.inf
-            valid=bool(result.success and violation<=cfg.feasibility_tolerance)
-            self.last_diagnostics.append(dict(solver='scp_checked_qp',seed=label,solve_time_s=elapsed,
-                iterations=int(result.nit),solver_success=valid,converged=bool(result.converged),kkt_certificate=getattr(result,"kkt_certificate",None),
-                message=str(result.message),violation=violation,variables=n,state_intervals=len(ds),
-                constraints=len(raw),control_step_m=cfg.control_step,solution_source=result.solution_source,qp_solves=len(result.qp_events),qp_events=result.qp_events))
-            rank=(not valid,violation if not valid else 0.,float(result.fun))
-            if best_rank is None or rank<best_rank:
-                best=(steering,valid,str(result.message),float(result.fun));best_rank=rank
-            if valid:
-                self.last_retry_diagnostics.extend(dict(seed=name,reason='feasible iterate already found') for name,_ in attempted_candidates[index+1:]);break
-        assert best is not None
-        return self._global_path(best[0],curvature,best[1],best[2],best[3])
+        from .psd_dispatch import plan_psd_dispatch
+        return plan_psd_dispatch(self,curvature_array,self.cbf_obstacles,initial_steering,previous_path,expansion)
 
     def _global_path(self,steering,curvature,success,message,objective):
         s,y,heading=self._rollout(steering,curvature)

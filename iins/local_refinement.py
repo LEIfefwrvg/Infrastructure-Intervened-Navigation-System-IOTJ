@@ -21,7 +21,7 @@ Array = np.ndarray
 
 @dataclass(frozen=True)
 class LocalRefinementConfig:
-    solver: str = "osqp"
+    solver: str = "dp_qp"
     max_deceleration: float | None = 6.0
     max_acceleration: float = 2.0
     horizon: int = 25
@@ -46,8 +46,13 @@ class LocalRefinementConfig:
             raise ValueError("max_deceleration must be finite and positive")
         if not np.isfinite(self.max_acceleration) or self.max_acceleration <= 0:
             raise ValueError("max_acceleration must be finite and positive")
-        if self.solver not in ("osqp", "slsqp"):
-            raise ValueError("solver must be osqp or slsqp")
+        if self.solver not in ("dp_qp", "osqp", "slsqp"):
+            raise ValueError("solver must be dp_qp, osqp or slsqp")
+        if (len(self.state_weights) != 4 or len(self.control_weights) != 2
+                or not np.all(np.isfinite(self.state_weights + self.control_weights))
+                or np.any(np.asarray(self.state_weights) < 0)
+                or np.any(np.asarray(self.control_weights) <= 0)):
+            raise ValueError("State weights must be nonnegative and control weights positive")
         if self.safe_time_gap<=0 or self.spatial_step<=0 or self.max_path_deviation<=0 or self.max_branch_vehicles<1:
             raise ValueError("Invalid safety/refinement parameters")
         if self.horizon < 2 or self.wheelbase <= 0:
@@ -86,14 +91,33 @@ class SpatialMPCRefiner:
     def _model(self, ds: float, curvature: float) -> tuple[Array, Array, Array]:
         return spatial_matrices(ds,curvature,self.config.wheelbase)
 
-    @staticmethod
-    def _augmented_cost(q: Array, desired: Array) -> Array:
-        cost = np.zeros((5, 5), dtype=float)
-        cost[:4, :4] = q
-        cost[:4, 4] = -q @ desired
-        cost[4, :4] = cost[:4, 4]
-        cost[4, 4] = float(desired @ q @ desired)
-        return cost
+    def _dynamic_programming(self, s, curvature, desired, state0):
+        """Algorithm 2: backward affine Riccati recursion, forward rollout.
+        """
+        n=len(s)-1; q=np.diag(self.config.state_weights)
+        r=np.diag(self.config.control_weights)
+        pmat=np.zeros((4,4)); pvec=np.zeros(4); value=0.
+        gains=np.empty((n,2,4)); feedforward=np.empty((n,2))
+        models=[self._model(ds,curvature[k]) for k,ds in enumerate(np.diff(s))]
+        for k in range(n-1,-1,-1):
+            a,b,c=models[k]; d=a@desired[k]+c-desired[k+1]
+            system=r+b.T@pmat@b
+            gain,shift=np.split(-np.linalg.solve(system,
+                np.column_stack((b.T@pmat@a,b.T@(pmat@d+pvec)))),[4],axis=1)
+            shift=shift[:,0]; gains[k]=gain; feedforward[k]=shift
+            closed=a+b@gain; offset=d+b@shift
+            value=float(value+shift@r@shift+offset@pmat@offset+2*pvec@offset)
+            pvec=gain.T@r@shift+closed.T@(pmat@offset+pvec)
+            pmat=q+gain.T@r@gain+closed.T@pmat@closed
+            pmat=(pmat+pmat.T)*.5
+        states=np.empty((n+1,4)); states[0]=state0; controls=np.empty((n,2))
+        for k,(a,b,c) in enumerate(models):
+            controls[k]=gains[k]@(states[k]-desired[k])+feedforward[k]
+            states[k+1]=a@states[k]+b@controls[k]+c
+        self.last_dp_policy=dict(gains=gains,feedforward=feedforward,
+            initial_value=float((state0-desired[0])@pmat@(state0-desired[0])
+                                +2*pvec@(state0-desired[0])+value))
+        return controls.ravel()
 
     def refine(
         self,
@@ -154,6 +178,7 @@ class SpatialMPCRefiner:
             jac[k+1]=a@jac[k]; jac[k+1,:,2*k:2*k+2]+=b
         q=np.asarray(cfg.state_weights); r=np.tile(cfg.control_weights,n)
         flat=jac.reshape(-1,2*n); weights=np.tile(q,n+1)
+        weights[-4:]=0.  # No terminal state cost in the manuscript objective.
         target=(base-desired).ravel()
         hess=2*(flat.T@(weights[:,None]*flat)+np.diag(r))
         linear=2*flat.T@(weights*target)
@@ -227,19 +252,50 @@ class SpatialMPCRefiner:
         tail[:,1]=np.clip(tail[:,1],cfg.steering_min,cfg.steering_max)
         seed=tail.ravel() if self.warm_start_used else np.zeros(2*n)
         self.last_diagnostics=[]
-        best=None; best_order=None; best_violation=np.inf
-        for order in product((0,1),repeat=len(conflicts)):
+        best=None; best_order=None
+        bounds=np.tile([[-cfg.moderation_limit,cfg.moderation_limit],
+                        [cfg.steering_min,cfg.steering_max]],(n,1))
+        def violation_of(x,a,b):
+            if not np.all(np.isfinite(x)): return np.inf
+            violation=max(0.,-float(np.min(a@x+b)),
+                          float(np.max(bounds[:,0]-x)),float(np.max(x-bounds[:,1])))
+            z=(base+np.einsum('ijk,k->ij',jac,x))[:,2]
+            if np.any(z<=0): return np.inf
+            accelerations=-x[::2,None]/np.column_stack([z[:-1],z[1:]])**3
+            violation=max(violation,float(np.max(accelerations))-cfg.max_acceleration)
+            if cfg.max_deceleration is not None:
+                violation=max(violation,float(-np.min(accelerations))-cfg.max_deceleration)
+            return violation
+        def branch_constraints(order):
             aa=[common]; bb=[common_b]
             for (_,mask,times),epsilon in zip(conflicts,order):
                 sign=1 if epsilon else -1
                 aa.append(sign*jac[mask,0]); bb.append(sign*(base[mask,0]-times[mask])-cfg.safe_time_gap)
-            a=np.concatenate(aa); b=np.concatenate(bb)
-            bounds=np.tile([[-cfg.moderation_limit,cfg.moderation_limit],
-                            [cfg.steering_min,cfg.steering_max]],(n,1))
+            return np.concatenate(aa),np.concatenate(bb)
+        # A feasible unconstrained optimum is also optimal over the union of
+        # all passing-order feasible sets. Check all orders BEFORE solving QPs.
+        self.last_dp_policy=None
+        if cfg.solver == 'dp_qp':
+            started=time.perf_counter()
+            dp=self._dynamic_programming(s,path.curvature,desired,state0)
+            dp_violation=np.inf
+            for order in product((0,1),repeat=len(conflicts)):
+                a,b=branch_constraints(order); violation=violation_of(dp,a,b)
+                dp_violation=min(dp_violation,violation)
+                if violation<=cfg.feasibility_tolerance:
+                    best=OptimizeResult(x=dp,fun=objective(dp),success=True)
+                    best_order=order
+                    break
+            self.last_diagnostics.append(dict(solver='riccati_dp',
+                solve_time_s=time.perf_counter()-started,variables=2*n,
+                solver_success=best is not None,violation=dp_violation,
+                fallback_required=best is None,backward_steps=n,forward_steps=n))
+        for order in (() if best is not None else product((0,1),repeat=len(conflicts))):
+            a,b=branch_constraints(order)
             seeds=[seed,np.zeros(2*n)] if self.warm_start_used and cfg.solver == 'slsqp' else [seed]
             for candidate in seeds:
                 solve_started=time.perf_counter()
-                if cfg.solver == 'osqp':
+                if cfg.solver in ('osqp','dp_qp'):
                     matrix=sparse.vstack([sparse.csc_matrix(a),sparse.eye(2*n)],format='csc')
                     qp=CertifiedQPSolver(max_iterations=20000)
                     solved=qp.solve(sparse.csc_matrix(np.triu(hess)),linear,matrix,
@@ -254,21 +310,14 @@ class SpatialMPCRefiner:
                         constraints=[dict(type='ineq',fun=lambda u:a@u+b,jac=lambda u:a)],
                         options=dict(maxiter=160,ftol=1e-8))
                 solve_elapsed=time.perf_counter()-solve_started
-                violation=max(0.,-float(np.min(a@result.x+b)),float(np.max(bounds[:,0]-result.x)),float(np.max(result.x-bounds[:,1])))
-                z=(base+np.einsum('ijk,k->ij',jac,result.x))[:,2]
-                if np.all(z>0):
-                    accelerations=-result.x[::2,None]/np.column_stack([z[:-1],z[1:]])**3
-                    violation=max(violation,float(np.max(accelerations))-cfg.max_acceleration)
-                    if cfg.max_deceleration is not None:
-                        violation=max(violation,float(-np.min(accelerations))-cfg.max_deceleration)
-                else: violation=np.inf
-                self.last_diagnostics.append(dict(solver=cfg.solver,constraints=len(b)+2*n,order=list(order),solve_time_s=solve_elapsed,iterations=int(getattr(result,"nit",0)),variables=2*n,solver_success=bool(result.success),message=str(result.message),violation=violation))
-                if cfg.solver == 'osqp':
+                violation=violation_of(result.x,a,b)
+                self.last_diagnostics.append(dict(solver='osqp' if cfg.solver=='dp_qp' else cfg.solver,constraints=len(b)+2*n,order=list(order),solve_time_s=solve_elapsed,iterations=int(getattr(result,"nit",0)),variables=2*n,solver_success=bool(result.success),message=str(result.message),violation=violation))
+                if cfg.solver in ('osqp','dp_qp'):
                     self.last_diagnostics[-1].update(qp_certified=solved.success,
                         qp_certificate=solved.certificate,qp_attempts=solved.attempts,
                         converged=bool(solved.success and violation<=cfg.feasibility_tolerance))
                 if violation<=cfg.feasibility_tolerance and result.success:
-                    if best is None or result.fun<best.fun: best=result; best_order=order; best_violation=violation
+                    if best is None or result.fun<best.fun: best=result; best_order=order
                     break
         success=best is not None
         controls=best.x if success else np.zeros(2*n)

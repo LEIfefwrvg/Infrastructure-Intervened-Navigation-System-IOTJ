@@ -1,4 +1,4 @@
-"""Shared exact interval integration of the linearized spatial vehicle model.
+"""Shared forward Euler discretization of the paper's spatial vehicle model.
 
 State [time, lateral, slowness, relative_heading], input [moderation, steering].
 Inputs and road curvature are held constant on each spatial interval.
@@ -9,9 +9,9 @@ import numpy as np
 def spatial_matrices(ds,curvature,wheelbase=2.6):
     if ds<=0 or wheelbase<=0:raise ValueError('Positive spatial step and wheelbase required')
     a=np.eye(4);a[0,2]=ds;a[1,3]=ds
-    b=np.zeros((4,2));b[0,0]=.5*ds**2;b[2,0]=ds
-    b[1,1]=.5*ds**2/wheelbase;b[3,1]=ds/wheelbase
-    c=np.array([0.,-.5*curvature*ds**2,0.,-curvature*ds])
+    b=np.zeros((4,2));b[2,0]=ds
+    b[3,1]=ds/wheelbase
+    c=np.array([0.,0.,0.,-curvature*ds])
     return a,b,c
 
 

@@ -100,6 +100,7 @@ class TravelTimeField:
     velocity: Array
     occupancy: Array
     longitudinal_time: Array
+    epoch: float = 0.
 
     def __post_init__(self) -> None:
         expected = self.grid.shape
@@ -116,6 +117,9 @@ class TravelTimeField:
             fill_value=None,
         )
         object.__setattr__(self, "_interpolator", interpolator)
+
+    def reference_valid(self,s,y):
+        return self.grid.contains(np.stack(np.broadcast_arrays(s,y),axis=-1))
 
     def bounds(self,s):
         return self.grid.y_min,self.grid.y_max
@@ -168,6 +172,33 @@ class TravelTimeField:
         return distance / projected_speed
 
 
+def estimate_ego_arrival_times(field, stations, reference_y, *, epoch=None, integration_step=None):
+    stations=np.asarray(stations,dtype=float);reference_y=np.asarray(reference_y,dtype=float)
+    if stations.ndim!=1 or len(stations)<2 or reference_y.shape!=stations.shape:
+        raise ValueError('Reference needs equal one-dimensional station/lateral arrays')
+    if not np.isfinite(stations).all() or not np.isfinite(reference_y).all() or np.any(np.diff(stations)<=0):
+        raise ValueError('Reference must be finite with increasing stations')
+    epoch=float(getattr(field,'epoch',0.) if epoch is None else epoch)
+    step=float(min(field.grid.ds,1.) if integration_step is None else integration_step)
+    if not np.isfinite([epoch,step,field.grid.ds]).all() or min(step,field.grid.ds)<=0:
+        raise ValueError('Invalid epoch, integration step or field cell length')
+    out=np.full(len(stations),np.inf);out[0]=epoch
+    for k,(a,b) in enumerate(zip(stations[:-1],stations[1:])):
+        edges=np.linspace(a,b,int(np.ceil((b-a)/step))+1)
+        middle=(edges[:-1]+edges[1:])*.5
+        # Check both endpoints and quadrature nodes, including a blocked start.
+        query=np.sort(np.r_[edges,middle]);lateral=np.interp(query,stations,reference_y)
+        low,high=field.bounds(query)
+        valid=(lateral>=low)&(lateral<=high)
+        if hasattr(field,'reference_valid'):valid &= field.reference_valid(query,lateral)
+        if not np.all(valid):break
+        costs=np.asarray(field.lookup(middle,np.interp(middle,stations,reference_y)),dtype=float)
+        if np.isnan(costs).any() or (costs<=0).any():raise ValueError('Traversal times must be positive or +inf')
+        if not np.isfinite(costs).all():break
+        out[k+1]=out[k]+float(np.sum(costs*np.diff(edges)/field.grid.ds))
+    return out
+
+
 @dataclass(frozen=True)
 class VehicleArrival:
     """One vehicle's absolute arrival times and lateral centers at spatial steps.
@@ -201,7 +232,7 @@ class FlowForecast:
     def field(self, future_index=0):
         v=self.velocity[:,:,future_index]
         return TravelTimeField(self.grid,v,self.occupancy[:,:,future_index],
-                               self.grid.ds/np.maximum(v[...,0],.5))
+                               self.grid.ds/np.maximum(v[...,0],.5),epoch=self.epoch)
 
     def vehicle_arrivals(self, vehicles, stations, max_duration=120., *, road=None, start_s=0.):
         if road is not None:
@@ -234,7 +265,7 @@ class GridTravelTimeEstimator:
         from pathlib import Path
         from .learn.training import load_model
         self.grid=grid
-        self.checkpoint=Path(checkpoint) if checkpoint else Path(__file__).parent/'learn/weights/toll_plaza.pt'
+        self.checkpoint=Path(checkpoint) if checkpoint else Path(__file__).parent/'learn/weights/latent_speed_bce.pt'
         self.model=load_model(self.checkpoint)
 
     def predict(self,occupancy,trajectories,agent_mask=None,epoch=0.):
@@ -274,18 +305,30 @@ class GridTravelTimeEstimator:
 def main():
     import argparse,json
     from pathlib import Path
-    from .learn.data import generate
-    from .learn.training import train,evaluate
     parser=argparse.ArgumentParser(); sub=parser.add_subparsers(dest='command',required=True)
-    p=sub.add_parser('generate'); p.add_argument('--output',required=True); p.add_argument('--count',type=int,default=256); p.add_argument('--seed',type=int,required=True)
-    p=sub.add_parser('train'); p.add_argument('--train-data',required=True); p.add_argument('--validation-data',required=True); p.add_argument('--checkpoint',required=True); p.add_argument('--epochs',type=int,default=40)
+    p=sub.add_parser('generate', help='Export an existing bundled split; no random generation'); p.add_argument('--output',required=True); p.add_argument('--split',choices=('train','test'),default='train')
+    p.add_argument('--dataset',choices=('etc_derived',),default='etc_derived')
+    p=sub.add_parser('train'); p.add_argument('--train-data',required=True); p.add_argument('--checkpoint',required=True); p.add_argument('--epochs',type=int,default=40)
+    p.add_argument('--seed',type=int,default=2026)
+    p.add_argument('--latent-dim',type=int,default=0)
+    p.add_argument('--kl-weight',type=float,default=.001)
+    p.add_argument('--kl-warmup-epochs',type=int,default=5)
+    p.add_argument('--reconstruction',choices=('legacy','normalized-speed-bce'),default='normalized-speed-bce')
+    p.add_argument('--speed-scale-mps',type=float,default=20.)
     p=sub.add_parser('evaluate'); p.add_argument('--data',required=True); p.add_argument('--checkpoint',required=True); p.add_argument('--output')
     a=parser.parse_args()
-    if a.command=='generate': generate(a.output,a.count,a.seed)
-    elif a.command=='train': train(a.train_data,a.validation_data,a.checkpoint,a.epochs)
+    if a.command=='generate':
+        from .learn.data import generate
+        generate(a.output, split=a.split, dataset=a.dataset)
+    elif a.command=='train':
+        from .learn.training import train
+        train(a.train_data,a.checkpoint,a.epochs,a.seed,a.latent_dim,a.kl_weight,a.kl_warmup_epochs,a.reconstruction,a.speed_scale_mps)
     else:
+        from .learn.training import evaluate
         result=evaluate(a.checkpoint,a.data); report=json.dumps(result,indent=2); print(report)
-        if a.output: Path(a.output).write_text(report+'\n')
+        if a.output:
+            Path(a.output).parent.mkdir(parents=True, exist_ok=True)
+            Path(a.output).write_text(report+'\n')
 
 
 class RoadTravelTimeField:
@@ -297,6 +340,13 @@ class RoadTravelTimeField:
         self.points=self.grid.centers[self.grid.mask]
         self.tree=cKDTree(self.points)
         self.values=forecast.velocity[self.grid.mask]
+
+    @property
+    def epoch(self):
+        return self.forecast.epoch
+
+    def reference_valid(self,s,y):
+        return self.grid.contains(self.road.world(np.asarray(s)+self.start_s,y))
 
     def world_velocity(self,xy,k=0):
         distance,indices=self.tree.query(xy,k=min(4,len(self.points)))
